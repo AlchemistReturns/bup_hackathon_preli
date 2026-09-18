@@ -61,6 +61,9 @@ the deadline still applies to the response.
 
 ## 2. Architecture: LLM → guardrails → optimizer → replay
 
+Diagrams: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (overall request flow)
+and [`docs/OPTIMIZER.md`](docs/OPTIMIZER.md) (LP formulation in detail).
+
 ### 2.1 Interpretation (untrusted input)
 
 `app/llm_client.py` sends all operator notes for a scenario in **one** model call,
