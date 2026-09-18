@@ -1,7 +1,8 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pydantic==2.9.2
-pulp==2.9.0
+scipy==1.14.1
+numpy==2.2.6
 langgraph==0.2.34
-openai==1.51.0
+openai==1.109.1
 python-dotenv==1.0.1
