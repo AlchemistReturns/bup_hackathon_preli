@@ -5,6 +5,13 @@ by SciPy's in-process HiGHS solver (`scipy.optimize.linprog(method="highs")`).
 No heuristics, no MILP relaxation — every solve is a global optimum for the
 given directives, or the request fails.
 
+## At a glance
+
+![GridWise optimizer pipeline: input, directive compilation, LP build, HiGHS solve, reconstruction and validation, output](optimizer.png)
+
+*Six stages, from validated directives to a plan handed to replay. The sections
+below expand each one.*
+
 ## Variable layout
 
 48 continuous decision variables, indexed `0..47`, built once at import as a
