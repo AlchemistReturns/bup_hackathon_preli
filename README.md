@@ -38,12 +38,23 @@ docker compose down
 
 ## Known scaffold shortcuts (fix once base API is confirmed working end-to-end)
 - No round-trip battery efficiency loss modeled — LP is pure energy balance.
-- No binary charge/discharge exclusivity constraint (relies on cost-minimality; code post-processes
-  the rare simultaneous case as a fallback, see `optimizer.py`).
+- Charge/discharge exclusivity is structural: the LP uses one signed battery variable, so a simultaneous
+  charge+discharge hour cannot be represented (the old split-variable model produced them on SAMPLE-02/04/08).
+- If the directive set is infeasible, `solve()` re-solves with grid-cap and reserve limits made elastic
+  (physics stays hard) and `main.py` reports it in `plan_summary`; `ReplayError` falls back to a grid-only plan.
 - `total_grid_kwh`/`total_cost_bdt`/`peak_grid_kwh` are taken from `replay()`'s recompute, not the
   solver's raw output, so they're guaranteed self-consistent with `hourly_plan`.
 - No persistence/caching of LLM calls; every request re-calls the API.
 - CBC (PuLP's bundled solver) is used; swap for a commercial solver if scenario size grows.
+
+## Tests
+```
+uv pip install -r requirements-dev.txt --python .venv
+.venv\Scripts\python -m pytest -q
+```
+Needs the public sample-cases JSON at `temporary/BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json` (gitignored).
+`scripts/baseline_public_cases.py` prints the reference-vs-ours cost table with the LLM bypassed.
+No test calls the live LLM.
 
 ## Tested locally
 `app/main.py`'s `/health` and `/optimize-energy` were smoke-tested with `TestClient` and a stubbed
