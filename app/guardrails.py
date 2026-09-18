@@ -4,6 +4,7 @@ The LLM's JSON is never trusted directly — every field is checked here
 before anything is handed to the optimizer. Any failure raises
 GuardrailError with a message that is fed back to the LLM for a retry.
 """
+import math
 from typing import Any, Dict, List
 from app.config import DIRECTIVE_TYPES
 from app.schemas import DirectiveInterpretation
@@ -41,20 +42,24 @@ def validate_entry(entry: Dict[str, Any], expected_note_index: int, battery_capa
         raise GuardrailError(f"entry for note {expected_note_index} is not an object")
 
     note_index = entry.get("note_index")
-    if note_index != expected_note_index:
+    if type(note_index) is not int or note_index != expected_note_index:
         raise GuardrailError(
             f"expected note_index {expected_note_index} at this position, got {note_index!r}"
         )
 
     directive_type = entry.get("directive_type")
-    if directive_type not in DIRECTIVE_TYPES:
+    if not isinstance(directive_type, str) or directive_type not in DIRECTIVE_TYPES:
         raise GuardrailError(
             f"note {expected_note_index}: directive_type must be one of {sorted(DIRECTIVE_TYPES)}, got {directive_type!r}"
         )
 
     applies = entry.get("applies")
     adjustment = entry.get("structured_adjustment")
-    explanation = entry.get("explanation", "") or ""
+    explanation = entry.get("explanation")
+    if not isinstance(explanation, str) or not explanation.strip():
+        raise GuardrailError(f"note {expected_note_index}: explanation must be a non-empty string")
+    if "structured_adjustment" not in entry:
+        raise GuardrailError(f"note {expected_note_index}: structured_adjustment is required")
 
     if directive_type == "no_op":
         if applies is not False:
@@ -91,15 +96,15 @@ def validate_entry(entry: Dict[str, Any], expected_note_index: int, battery_capa
 
     if directive_type == "minimum_battery_reserve":
         val = adjustment["minimum_energy_kwh"]
-        if not isinstance(val, (int, float)) or isinstance(val, bool) or val < 0:
-            raise GuardrailError(f"note {expected_note_index}: minimum_energy_kwh must be a non-negative number")
+        if not _finite_nonnegative(val):
+            raise GuardrailError(f"note {expected_note_index}: minimum_energy_kwh must be finite and non-negative")
         if val > battery_capacity:
             raise GuardrailError(f"note {expected_note_index}: minimum_energy_kwh exceeds battery capacity")
 
     if directive_type == "max_grid_window":
         val = adjustment["max_grid_kwh"]
-        if not isinstance(val, (int, float)) or isinstance(val, bool) or val < 0:
-            raise GuardrailError(f"note {expected_note_index}: max_grid_kwh must be a non-negative number")
+        if not _finite_nonnegative(val):
+            raise GuardrailError(f"note {expected_note_index}: max_grid_kwh must be finite and non-negative")
 
     return DirectiveInterpretation(
         note_index=note_index,
@@ -108,6 +113,13 @@ def validate_entry(entry: Dict[str, Any], expected_note_index: int, battery_capa
         structured_adjustment=adjustment,
         explanation=explanation,
     )
+
+
+def _finite_nonnegative(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
 
 
 def validate_all(raw_entries: List[Dict[str, Any]], num_notes: int, battery_capacity: float) -> List[DirectiveInterpretation]:
