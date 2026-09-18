@@ -280,9 +280,13 @@ docker pull abrar19/gridwise:latest
 docker run --rm -p 8000:8000 --env-file .env abrar19/gridwise:latest
 curl http://localhost:8000/health
 ```
-> Always verify the exact tag/digest you pulled matches what was published,
+Published: [`docker.io/abrar19/gridwise:latest`](https://hub.docker.com/r/abrar19/gridwise)
+(digest `sha256:7e11beecc5ce93f68ab49553b8499fcf65fffa21871ab6964af145443b7e712a`),
+verified with a clean-state pull + 10/10 live sample check (§5) before publishing.
+
+> Always verify the exact tag/digest you pulled matches what's published above,
 > and re-run the public sample check (§5) against the running container
-> before trusting it.
+> before trusting it — this digest reflects the state at publish time only.
 
 The image binds to `0.0.0.0:8000`. `.env`, virtual environments, and Git
 metadata are excluded from the build context via `.dockerignore` — the image
