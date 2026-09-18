@@ -1,5 +1,9 @@
 from typing import List, Optional, Literal, Dict, Any
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class FiniteModel(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
 
 DirectiveType = Literal[
     "solar_reduction",
@@ -13,14 +17,14 @@ DirectiveType = Literal[
 
 # ---------- Request ----------
 
-class HourEntry(BaseModel):
-    hour: int = Field(ge=0, le=23)
+class HourEntry(FiniteModel):
+    hour: int = Field(ge=0, le=23, strict=True)
     demand_kwh: float = Field(ge=0)
     solar_kwh: float = Field(ge=0)
     tariff_bdt_per_kwh: float = Field(ge=0)
 
 
-class BatteryConfig(BaseModel):
+class BatteryConfig(FiniteModel):
     capacity_kwh: float = Field(gt=0)
     initial_energy_kwh: float = Field(ge=0)
     minimum_energy_kwh: float = Field(ge=0)
@@ -36,7 +40,7 @@ class BatteryConfig(BaseModel):
         return self
 
 
-class ScenarioRequest(BaseModel):
+class ScenarioRequest(FiniteModel):
     scenario_id: str
     operator_notes: List[str] = Field(min_length=1, max_length=3)
     hours: List[HourEntry] = Field(min_length=24, max_length=24)
@@ -61,9 +65,9 @@ class ScenarioRequest(BaseModel):
 
 # ---------- Response ----------
 
-class DirectiveInterpretation(BaseModel):
-    note_index: int
-    applies: bool
+class DirectiveInterpretation(FiniteModel):
+    note_index: int = Field(ge=0, strict=True)
+    applies: bool = Field(strict=True)
     directive_type: DirectiveType
     structured_adjustment: Optional[Dict[str, Any]] = None
     explanation: str = ""
@@ -81,8 +85,8 @@ class DirectiveInterpretation(BaseModel):
         return self
 
 
-class HourlyPlanEntry(BaseModel):
-    hour: int = Field(ge=0, le=23)
+class HourlyPlanEntry(FiniteModel):
+    hour: int = Field(ge=0, le=23, strict=True)
     grid_kwh: float = Field(ge=0)
     solar_used_kwh: float = Field(ge=0)
     battery_action: Literal["charge", "discharge", "idle"]
@@ -96,7 +100,7 @@ class HourlyPlanEntry(BaseModel):
         return self
 
 
-class OptimizeEnergyResponse(BaseModel):
+class OptimizeEnergyResponse(FiniteModel):
     scenario_id: str
     directive_interpretation: List[DirectiveInterpretation]
     hourly_plan: List[HourlyPlanEntry]
