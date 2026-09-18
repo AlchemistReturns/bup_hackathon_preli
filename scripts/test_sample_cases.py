@@ -6,6 +6,7 @@ Usage:
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -19,9 +20,11 @@ def close(a, b, tol=TOL):
 
 def check_case(case, base_url):
     scenario_id = case["id"]
+    start = time.perf_counter()
     resp = requests.post(f"{base_url}/optimize-energy", json=case["input"], timeout=60)
+    latency_ms = (time.perf_counter() - start) * 1000
     if resp.status_code != 200:
-        return False, [f"HTTP {resp.status_code}: {resp.text[:300]}"]
+        return False, [f"HTTP {resp.status_code}: {resp.text[:300]}"], latency_ms
 
     got = resp.json()
     expected = case["expected_output"]
@@ -47,7 +50,7 @@ def check_case(case, base_url):
     if len(got.get("hourly_plan", [])) != 24:
         problems.append(f"hourly_plan has {len(got.get('hourly_plan', []))} entries, expected 24")
 
-    return (len(problems) == 0), problems
+    return (len(problems) == 0), problems, latency_ms
 
 
 def main():
@@ -64,15 +67,21 @@ def main():
     cases = data["cases"]
 
     passed = 0
+    latencies = []
     for case in cases:
-        ok, problems = check_case(case, args.url)
+        ok, problems, latency_ms = check_case(case, args.url)
+        latencies.append(latency_ms)
         status = "PASS" if ok else "FAIL"
-        print(f"[{status}] {case['id']} — {case.get('label', '')}")
+        print(f"[{status}] {case['id']} — {case.get('label', '')} — {latency_ms:.1f} ms")
         for p in problems:
             print(f"    - {p}")
         passed += ok
 
-    print(f"\n{passed}/{len(cases)} passed")
+    latencies.sort()
+    n = len(latencies)
+    median = latencies[n // 2] if n % 2 else (latencies[n // 2 - 1] + latencies[n // 2]) / 2
+    p95 = latencies[min(int(round(0.95 * (n - 1))), n - 1)]
+    print(f"\n{passed}/{len(cases)} passed; median={median:.1f} ms; p95={p95:.1f} ms")
     sys.exit(0 if passed == len(cases) else 1)
 
 

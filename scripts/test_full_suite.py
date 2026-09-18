@@ -11,10 +11,12 @@ TOL = 0.01
 def close(a, b, tol=TOL):
     return abs(a - b) <= tol
 
+DEFAULT_CASES_FILE = Path(__file__).resolve().parent.parent / "temporary" / "BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json"
+
 def main():
     client = TestClient(app)
-    cases_file = r"D:\buppreli\BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json"
-    data = json.loads(Path(cases_file).read_text(encoding="utf-8"))
+    cases_file = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CASES_FILE
+    data = json.loads(cases_file.read_text(encoding="utf-8"))
     cases = data["cases"]
 
     passed = 0

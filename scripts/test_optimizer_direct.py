@@ -8,8 +8,10 @@ from app.schemas import BatteryConfig, HourEntry, DirectiveInterpretation
 from app.optimizer import solve
 from app.replay import replay
 
+DEFAULT_CASES_FILE = Path(__file__).resolve().parent.parent / "temporary" / "BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json"
+
 def test_all():
-    with open(r"d:\buppreli\BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json", "r", encoding="utf-8") as f:
+    with open(DEFAULT_CASES_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     cases = data["cases"]
@@ -39,7 +41,7 @@ def test_all():
             all_ok = False
 
     print("\nSummary:", "ALL TESTS PASSED!" if all_ok else "SOME TESTS FAILED!")
-    return all_ok
+    assert all_ok
 
 if __name__ == "__main__":
     test_all()
