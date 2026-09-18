@@ -2,83 +2,101 @@
 
 An LLM interprets operator notes, deterministic guardrails validate every directive,
 and an exact continuous linear program minimizes 24-hour grid cost. A separate
-replay verifies the serialized response before the API returns it.
+replay independently recomputes and verifies the response before the API returns it.
 
-## Local setup (Python 3.12)
-
-PowerShell:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-Copy-Item .env.example .env
-# Edit .env locally and set your own OPENAI_API_KEY. Never commit it.
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+operator notes ─▶ LLM interpretation ─▶ guardrails ─▶ optimizer (LP) ─▶ replay ─▶ response
+                   (untrusted)           (deterministic)  (HiGHS)       (independent check)
 ```
 
-Linux/macOS:
+---
 
-```sh
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -r requirements-dev.txt
-cp .env.example .env
-# Edit .env locally to supply OPENAI_API_KEY.
-.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+## 1. Environment & configuration
+
+Copy `.env.example` to `.env` and fill in your own key — never commit `.env`.
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `OPENAI_API_KEY` | yes | — | your OpenAI key; the app fails at startup without it being set (empty string default, calls fail) |
+| `OPENAI_MODEL` | no | `gpt-4o-mini` | must support the selected API mode, strict structured outputs, and `temperature=0` |
+| `OPENAI_API_MODE` | no | `chat` | `chat` (Chat Completions) or `responses` (Responses API); both use the same key/model |
+| `LLM_MAX_RETRIES` | no | `2` | 0–2; LangGraph-owned retries on guardrail failure, feeding the error back to the model |
+| `LLM_CACHE_SIZE` | no | `0` | 0 disables the in-memory interpretation cache; set >0 (e.g. `256`) to opt in |
+| `LLM_CACHE_TTL_SECONDS` | no | `900` | cache entry lifetime when caching is enabled; range (0, 86400] |
+
+All values are read once at import time in `app/config.py` (via `python-dotenv`) and
+validated with hard failures (`ValueError`) for out-of-range settings, so a bad
+`.env` fails fast at startup rather than mid-request.
+
+Fixed (non-configurable) budgets, also in `app/config.py`:
+
+| Constant | Value | Applies to |
+|---|---|---|
+| `LLM_TIMEOUT_SECONDS` | 6.0s | per model HTTP attempt |
+| `LLM_BUDGET_SECONDS` | 20.0s | whole interpretation stage (all attempts) |
+| `SOLVER_TIMEOUT_SECONDS` | 5.0s | HiGHS LP solve |
+| `REQUEST_TIMEOUT_SECONDS` | 27.0s | whole `/optimize-energy` request |
+
+Blocking work runs in the thread pool so `/health` stays responsive under load.
+A timed-out worker may finish in the background, but its result is discarded and
+the deadline still applies to the response.
+
+### Model provider
+
+- Provider: **OpenAI** only, via the official Python SDK (`openai==1.109.1` — bumped
+  from the original `1.51.0` pin, which predates the Responses API).
+- Two request modes, selected by `OPENAI_API_MODE`:
+  - `chat` (default) — Chat Completions with a strict JSON schema response format.
+  - `responses` — the Responses API, same schema/semantics.
+- SDK-level retries are disabled; **LangGraph alone** owns the bounded retry loop
+  (`LLM_MAX_RETRIES`), so a retry always carries the guardrail's rejection reason
+  back to the model rather than blindly repeating the same request.
+- No provider error is ever silently converted to `no_op`. Exhausting the retry
+  budget raises `InterpretationError` and optimization does not run — the API
+  returns a 500, never a guessed schedule.
+- Provider exception text, raw model output, and stack traces are never returned
+  to the client or logged — only stage timings for successful requests.
+
+---
+
+## 2. Architecture: LLM → guardrails → optimizer → replay
+
+### 2.1 Interpretation (untrusted input)
+
+`app/llm_client.py` sends all operator notes for a scenario in **one** model call,
+using a strict JSON schema, requesting a compact numeric protocol rather than the
+public field names directly (fewer generated tokens):
+
+```
+{"d": [[type, value, start, end, ...], ...]}
 ```
 
-For production, install requirements.txt instead of requirements-dev.txt.
+- `type`: 0=ignore, 1=solar, 2=reserve, 3=no_charge, 4=no_discharge, 5=grid_cap
+- `value`: the numeric adjustment (0/unused for ignore, no_charge, no_discharge)
+- `start`/`end` pairs: one or more disjoint clock windows
 
-Required environment variable: OPENAI_API_KEY. Optional: OPENAI_MODEL
-(default gpt-4o-mini, must support the selected API, strict structured outputs
-and temperature=0); LLM_MAX_RETRIES (0-2, default 2). All notes for one scenario
-are interpreted together. Battery capacity accompanies the notes so percentage
-reserves can be converted into kWh.
+`app/llm_protocol.py` expands this into the public directive schema
+(`solar_reduction`, `minimum_battery_reserve`, `no_charge_window`,
+`no_discharge_window`, `max_grid_window`, `no_op`) and generates explanation text
+locally — the model never writes free-text explanations, only structure.
+`app/time_windows.py` deterministically converts clock boundaries to start-inclusive,
+end-exclusive hour lists (e.g. "9 AM until 11 AM" → `[9, 10]`), so the model's
+clock-boundary output can't accidentally include the stopping hour.
 
-## Endpoints and sample checks
+The model is never trusted directly. `app/guardrails.py` independently validates:
+mapping shape, supported types, finite numeric ranges, sorted/unique hours 0–23,
+exact required adjustment fields per type, and `applies`/`no_op` semantics. On
+failure, `app/graph.py` (a LangGraph `call_llm → validate → retry|fail` pipeline)
+retries up to `LLM_MAX_RETRIES` times with the guardrail error fed back to the
+model. If retries are exhausted, the pipeline raises rather than guessing — no
+directive is ever invented, and the request fails safe with a 500.
 
-GET /health returns HTTP 200 with {"status":"ok"} when the application can serve
-requests. This is local readiness; it does not make a paid model call or certify
-provider quota/availability.
+### 2.2 Optimization (`app/optimizer.py`)
 
-POST /optimize-energy accepts the published scenario schema and returns the
-published interpretation, hourly plan, totals and summary. Invalid request JSON
-or schema returns 400. Unavailable interpretation, infeasibility, solver failure,
-replay failure or request timeout returns a controlled 500 without a schedule.
-
-```sh
-curl http://localhost:8000/health
-curl -X POST http://localhost:8000/optimize-energy -H "Content-Type: application/json" --data-binary @sample_request.json
-```
-
-To obtain sample_request.json, save any case.input object from
-tests/fixtures/public_cases.json. Or use the sample checker directly:
-
-```powershell
-# No credentials or network calls: solve using the public reference directives.
-.\.venv\Scripts\python.exe scripts/check_samples.py
-# Full API path, including real interpretation; requires a running server/key.
-.\.venv\Scripts\python.exe scripts/check_samples.py --base-url http://localhost:8000
-# Repeat the live run and save a complete per-case report (repeats can hit cache).
-.\.venv\Scripts\python.exe scripts/check_samples.py --base-url http://localhost:8000 --repeat 2 --report live_results.json
-# Offline optimizer timing (50 solves, including the first solve).
-.\.venv\Scripts\python.exe scripts/check_samples.py --repeat 5
-# Regression suite: live SDK transport is mocked; no paid calls.
-.\.venv\Scripts\python.exe -m pytest -q
-```
-
-Use .venv/bin/python for these commands on Linux/macOS. The checker requires
-each case to replay successfully and its cost to match the published optimum
-within 0.01 BDT. Live checks separately compare the machine-readable interpretation,
-replay against organizer ground truth, verify response consistency and compare cost.
-The runner continues after failed cases and exits with a nonzero status if any fail.
-Explanation wording and the particular optimal action sequence may differ.
-
-## Optimizer
-
-app/optimizer.py uses SciPy's in-process HiGHS LP solver. It has exactly 48
-continuous variables before presolve: grid[h] and energy_after[h] for 24 hours.
-
-With previous energy equal to initial_energy_kwh at hour zero:
+SciPy's in-process HiGHS LP solver. Exactly 48 continuous variables before
+presolve: `grid[h]` and `energy_after[h]` for 24 hours (no split charge/discharge
+variables, no binary switches — battery action is derived from the signed energy
+delta each hour).
 
 ```text
 delta[h] = energy_after[h] - previous_energy[h]
@@ -89,160 +107,255 @@ minimize sum(tariff[h] * grid[h])
 demand[h] - effective_solar[h] <= grid[h] - delta[h] <= demand[h]
 -discharge_limit[h] <= delta[h] <= charge_limit[h]
 active_reserve[h] <= energy_after[h] <= capacity
-0 <= grid[h] <= active_grid_cap[h]  (no upper bound if uncapped)
+0 <= grid[h] <= active_grid_cap[h]      (no upper bound if uncapped)
 energy_after[23] = initial_energy_kwh
 ```
 
-The sparse coefficient matrices are constructed once at import. Bounds, costs
-and right-hand sides are request-local, making concurrent requests independent.
-The solver must report an optimal finite solution. Battery actions are derived
-from signed energy differences, so no simultaneous charge/discharge variables or
-binary switches exist. Free solar can be curtailed; grid export is prohibited.
-The lossless battery model follows the challenge; efficiency losses are not an
-omitted feature. Peak grid use is reported, not added to the cost objective.
+Validated directives compile into per-hour parameters (effective solar, active
+reserve, no-charge/no-discharge hours, active grid cap) before the LP is built.
+Sparse coefficient matrices are constructed once at import; bounds/costs/RHS are
+request-local, so concurrent requests are independent. The solver must report an
+optimal, finite solution or the request fails (`OptimizationError`). Free solar
+can be curtailed; grid export is prohibited. The battery model is lossless (no
+round-trip efficiency loss) — this follows the challenge spec, not an oversight.
+Peak grid use is reported but not part of the cost objective.
 
-The optimizer's directive compiler and app/replay.py are independent.
-Replay recomputes physics and checks directives directly. It also checks the
-JSON-round-tripped response and its six-decimal reported totals.
+### 2.3 Replay / independent verification (`app/replay.py`)
 
-## Interpretation and reliability
+Completely independent of the optimizer's own directive compiler. Recomputes
+physics and checks directive compliance directly from the JSON-round-tripped
+response — the same thing a hidden judge would do. Also verifies the response's
+six-decimal reported totals match its own recomputation. If replay disagrees with
+what the optimizer produced, the API returns 500 rather than shipping a plan that
+looks fine but isn't self-consistent.
 
-The model API requests a strict JSON schema, then guardrails independently
-check mappings, supported types, finite numeric ranges, sorted unique hours,
-exact adjustment fields and applies/no_op semantics.
+---
 
-The model returns a compact numeric internal schema: d is the directive list;
-each row is [type,value,start,end,...]. Types are 0=ignore, 1=solar, 2=reserve,
-3=no charge, 4=no discharge, 5=grid cap. Ignore is [0,0]; unused values are zero.
-Additional start/end pairs represent disjoint windows. Guardrails independently
-validate row lengths, type codes, integer clock boundaries and numeric ranges.
-app/llm_protocol.py expands this into typed directives and generates explanations
-locally, reducing generated tokens without changing the public response schema.
-The model extracts start_hour and end_hour clock boundaries through that protocol.
-app/time_windows.py deterministically expands each window using start-inclusive,
-end-exclusive intervals. The public response still contains hours; time_windows
-is internal only. For example, 9 AM until 11 AM becomes [9, 10]. This prevents
-the model's hour-list generation from accidentally including the stopping hour.
-The model remains responsible for understanding the note and its clock times;
-there are no sample-ID or phrase lookup shortcuts.
+## 3. Local setup (Python 3.12)
 
-No provider error is converted to no_op. When the bounded interpretation retry
-budget is exhausted, optimization does not run. Provider exception text, raw
-model output and stack traces are not returned or logged by application handlers.
-SDK retries are disabled; LangGraph alone owns up to two retries.
-
-Each model attempt has a 6-second HTTP timeout, the interpretation stage has a
-20-second budget, HiGHS has a 5-second solve limit, and the API has a 27-second
-response deadline. Blocking work runs in the thread pool to keep /health
-responsive. A timed-out worker may finish in the background; its result is
-discarded, and model/solver limits still apply. Deadline settings are constants
-in app/config.py. Successful requests log stage timings without notes or keys.
-
-The OpenAI SDK was updated because the original 1.51.0 pin predates the Responses
-API. The existing model selection is preserved.
-
-## First-request latency (no answer caching by default)
-
-The model client reuses HTTP connections. All notes share one model call, with a
-compact numeric strict output schema. Local client/graph initialization runs at
-server startup without paid calls or preloaded answers. OPENAI_API_MODE defaults
-to chat (Chat Completions); responses retains the Responses API option. Both use
-the existing OPENAI_MODEL and key, with no model change or premium service tier.
-The 48-variable solver and independent replay still run on every request.
-
-LLM_CACHE_SIZE defaults to 0: every request makes a fresh model call, including
-repeated identical inputs. Check X-Interpretation-Cache=disabled. An existing
-environment setting overrides the default, so explicitly set it for judging:
-
+PowerShell:
 ```powershell
-$env:LLM_CACHE_SIZE = "0"
-$env:OPENAI_API_MODE = "chat"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+Copy-Item .env.example .env
+# Edit .env locally and set your own OPENAI_API_KEY. Never commit it.
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Two alternating passes over all public cases (20 requests per version) measured
-the previous implementation at median 1586.8 ms / p95 2478.0 ms, and the numeric
-Chat implementation at median 1180.6 ms / p95 2022.5 ms. Both passed 20/20 with
-caching disabled. The new maximum, including the first request, was 2039.3 ms.
-The final prompt also passed all 12 additional live interpretation checks.
-These are small-sample measurements, not a latency guarantee. Provider/network
-spikes and retries can still dominate. Nearest-rank p95 on just ten cases is
-the maximum; use more samples to characterize the tail reliably.
-
-To compare two running no-cache versions using alternating requests:
-
-```powershell
-.\.venv\Scripts\python.exe scripts/benchmark_uncached.py --baseline-url http://127.0.0.1:8002 --candidate-url http://127.0.0.1:8003 --repeat 2 --report comparison.json
-# Additional real-model checks of new wording, values and time boundaries (paid):
-.\.venv\Scripts\python.exe scripts/check_interpretation_edges.py --report edge_results.json
+Linux/macOS:
+```sh
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+cp .env.example .env
+.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-### Optional repeat-request cache (not used for the benchmark)
+For production, install `requirements.txt` instead of `requirements-dev.txt`
+(the dev file adds `pytest`/`httpx` for the test suite only).
 
-Only successful, guardrail-validated interpretations are cached in memory. The key
-includes exact note text and order, battery capacity, API mode, model and protocol version.
-Identical concurrent requests share one in-flight interpretation. Returned objects
-are isolated from mutation. Errors are never cached, and unrelated keys do not
-wait on each other's network calls. The cache is per server worker, not shared
-across machines, and is cleared by restart.
+Using `uv` instead of raw `pip` (faster, and pins the venv's Python explicitly):
+```sh
+uv venv .venv --python 3.12
+uv pip install -r requirements-dev.txt --python .venv
+```
 
-Optional settings: LLM_CACHE_SIZE (default 0; set e.g. 256 to opt in) and
-LLM_CACHE_TTL_SECONDS (default 900 seconds). Set LLM_CACHE_SIZE=0 before starting
-the server to measure fresh LLM latency; repeating client requests alone does not
-bypass the server cache. A cache miss uses the real model, never a sample lookup.
-Disable caching if your evaluation requires a fresh model call for every request.
+---
 
-Responses include X-Interpretation-Cache (miss/hit/shared/disabled) and Server-Timing
-headers for interpretation, optimization and validation. The sample checker saves
-these with per-request latency in its JSON report. Compare cache hits separately
-from fresh-note requests; network/provider load can still cause latency spikes.
+## 4. Endpoints
 
-## Docker
+`GET /health` — HTTP 200 `{"status":"ok"}` when the app can serve requests. This
+is local readiness only; it does not make a paid model call or certify provider
+quota/availability.
+
+`POST /optimize-energy` — accepts the published scenario schema, returns the
+published interpretation, hourly plan, totals, and summary.
+- Invalid request JSON/schema → 400.
+- Unavailable interpretation, infeasibility, solver failure, replay failure, or
+  request timeout → controlled 500, never a partial or guessed schedule.
 
 ```sh
-docker build -t gridwise:48-variable .
-docker run --rm -p 8000:8000 --env-file .env gridwise:48-variable
+curl http://localhost:8000/health
+curl -X POST http://localhost:8000/optimize-energy \
+  -H "Content-Type: application/json" --data-binary @sample_request.json
+```
+
+`sample_request.json` can be any `case.input` object from
+`tests/fixtures/public_cases.json`.
+
+---
+
+## 5. Public-sample test procedure and expected result
+
+The organizer-provided BUP CSE Fest 2026 public sample pack (10 cases) lives at
+`tests/fixtures/public_cases.json`.
+
+```powershell
+# Offline: solve using the public reference directives, no LLM/network/key needed.
+.\.venv\Scripts\python.exe scripts/check_samples.py
+
+# Live: full pipeline including real LLM interpretation. Requires a running
+# server (see §3) and a valid OPENAI_API_KEY.
+.\.venv\Scripts\python.exe scripts/check_samples.py --base-url http://localhost:8000
+
+# Repeat the live run and save a full per-case report (repeats can hit cache
+# if LLM_CACHE_SIZE>0).
+.\.venv\Scripts\python.exe scripts/check_samples.py --base-url http://localhost:8000 --repeat 2 --report live_results.json
+
+# Regression suite: SDK transport is mocked, no paid calls.
+.\.venv\Scripts\python.exe -m pytest -q
+```
+(Linux/macOS: use `.venv/bin/python`.)
+
+**Expected result:** `10/10 passed` on both the offline and live paths — every
+case must replay successfully and its cost must match the published optimum
+within 0.01 BDT. The live path additionally reports, per case:
+`interpretation=True`, `ground_truth_valid=True`, `optimal_cost=True`, and a
+`cache=` status (`hit`/`miss`/`disabled`). The runner continues past failed
+cases and exits non-zero if any fail. Explanation wording and the particular
+optimal action sequence are not required to match the reference byte-for-byte —
+only cost, directive semantics, and physical consistency.
+
+Last verified live run on `master`: 10/10 passed, `cache=disabled` on every
+case (default config), median latency ≈3.5s, p95 ≈5.5s (single-run sample —
+see §6 for caching behavior and its effect on latency).
+
+Observed offline optimizer timing: median ≈1.2ms, p95 ≈2ms per case (pure LP
+solve, no network).
+
+---
+
+## 6. Latency and the interpretation cache
+
+`LLM_CACHE_SIZE` defaults to `0` — **caching is off by default**, every request
+makes a fresh model call, including repeated identical inputs. Confirm this via
+the `X-Interpretation-Cache` response header (`disabled` when off). An existing
+environment variable overrides the default, so pin it explicitly if you need a
+guaranteed-fresh-call environment (e.g. for judging):
+
+```powershell
+$env:LLM_CACHE_SIZE = "0"
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+If enabled (`LLM_CACHE_SIZE` > 0): only successful, guardrail-validated
+interpretations are cached in memory. Cache key = exact note text + order +
+battery capacity + API mode + model + protocol version. Identical concurrent
+requests share one in-flight interpretation (single-flight). Returned objects
+are isolated from mutation. Errors are never cached. The cache is per
+server-worker, not shared across machines or processes, and clears on restart.
+
+Every response carries `X-Interpretation-Cache` (`miss`/`hit`/`shared`/`disabled`)
+and `Server-Timing` (interpretation/optimization/validation stage timings)
+headers. `scripts/check_samples.py` records both per request in its JSON report.
+
+To compare two running no-cache versions head-to-head:
+```powershell
+.\.venv\Scripts\python.exe scripts/benchmark_uncached.py --baseline-url http://127.0.0.1:8002 --candidate-url http://127.0.0.1:8003 --repeat 2 --report comparison.json
+```
+
+---
+
+## 7. Docker
+
+### Build and run locally
+```sh
+docker build -t gridwise:latest .
+docker run --rm -p 8000:8000 --env-file .env gridwise:latest
 curl http://localhost:8000/health
 ```
 
-The image binds to 0.0.0.0:8000; .env, virtual environments and Git metadata are
-excluded. Docker Compose remains supported. Before submission, push the built
-image to your registry, record its exact tag/digest and verify docker pull/run
-from another machine. A registry push and public deployment are not performed
-by this source update.
+Or with Compose:
+```sh
+docker compose up -d --build
+docker compose logs -f
+docker compose down
+```
 
-## Tests and known limits
+### Pull a published image (fallback if you don't want to build locally)
+```sh
+docker pull abrar19/gridwise:latest
+docker run --rm -p 8000:8000 --env-file .env abrar19/gridwise:latest
+curl http://localhost:8000/health
+```
+> Always verify the exact tag/digest you pulled matches what was published,
+> and re-run the public sample check (§5) against the running container
+> before trusting it.
 
-The suite covers the ten public cases and optimal costs, a separate 120-variable
-reference LP on 60 seeded randomized scenarios, surplus solar, flat/zero tariffs,
-zero battery rates, terminal infeasibility, concurrent solves, corrupted plans,
-non-finite inputs, percentage context, structured SDK requests, retry exhaustion,
-HTTP validation and response deadlines.
+The image binds to `0.0.0.0:8000`. `.env`, virtual environments, and Git
+metadata are excluded from the build context via `.dockerignore` — the image
+never bakes in your key; it's supplied at `docker run` time via `--env-file`/`-e`.
 
-Offline tests use organizer ground-truth directives and mocked model responses;
-they do not establish real-model paraphrase accuracy, live provider latency,
-public reachability or Docker runtime compatibility. Run the live sample checker
-and paraphrase tests before submission. Boundary regression tests cover midnight,
-single-hour and disjoint periods, malformed clock values, and the observed
-extra-ending-hour errors.
+---
 
-Overlapping reserve and grid caps use the strictest bound. The existing
-multiplicative interpretation for overlapping solar reductions is preserved.
-The supplied specification does not clearly define that overlap: confirm it
-with organizers if such cases are in scope.
+## 8. Dependencies
 
-## Dependencies and credits
+| Package | Purpose |
+|---|---|
+| FastAPI / Starlette | HTTP API and request execution |
+| Pydantic | request/response schema validation |
+| NumPy / SciPy (HiGHS) | numerical LP solution |
+| OpenAI Python SDK | model access (chat or responses mode) |
+| LangGraph | bounded interpretation/validation/retry control |
+| python-dotenv | local `.env` configuration loading |
+| pytest / httpx (dev only) | tests, mocked SDK transport |
 
-FastAPI/Starlette: HTTP API and request execution.
-Pydantic: request/response validation.
-NumPy/SciPy/HiGHS: numerical LP solution.
-OpenAI Python SDK: model access.
-LangGraph: bounded interpretation/validation/retry control.
-python-dotenv: local configuration.
-pytest/httpx: tests and mocked SDK transport.
-The public fixture is the organizer-provided BUP CSE Fest 2026 sample pack.
-
-Reference documentation:
+Reference docs:
 - [SciPy HiGHS interface](https://docs.scipy.org/doc/scipy-1.14.1/reference/optimize.linprog-highs.html)
 - [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
 - [OpenAI latency optimization](https://developers.openai.com/api/docs/guides/latency-optimization)
+
+The public fixture (`tests/fixtures/public_cases.json`) is the organizer-provided
+BUP CSE Fest 2026 sample pack.
+
+---
+
+## 9. Limitations
+
+- **No round-trip battery efficiency loss** — the LP is pure energy balance
+  (matches the challenge spec, not an omission).
+- **No hidden judge access** — the offline/live checks here only validate
+  against the *public* sample pack; passing 10/10 does not guarantee behavior
+  on hidden judge cases.
+- **LLM interpretation is inherently non-deterministic** — even with
+  `temperature=0` and a strict schema, wording paraphrases can occasionally
+  shift the model's directive reading; guardrails catch structurally invalid
+  output, not semantically wrong-but-valid output.
+- **Overlapping directive semantics are underspecified upstream.** Overlapping
+  reserve and grid caps use the strictest bound; overlapping solar reductions
+  use a multiplicative interpretation. The organizer spec doesn't clearly
+  define this — confirm with organizers if such cases are in scope.
+- **Cache is per-process** — not shared across horizontally scaled workers or
+  machines; restarting a worker clears it.
+- **Offline tests use mocked model responses** and organizer ground-truth
+  directives — they don't establish real-model paraphrase accuracy, live
+  provider latency, public reachability, or Docker runtime compatibility on
+  their own. Run the live sample checker (§5) and a Docker pull/run (§7)
+  before submission.
+- **Published image freshness isn't automatic.** `docker pull abrar19/gridwise:latest`
+  (§7) only reflects whatever was last pushed; if source changes after a push,
+  rebuild and re-push before relying on the pulled image, and re-run §5 against
+  the freshly pulled container to confirm it's current.
+
+---
+
+## 10. Secret handling
+
+- `OPENAI_API_KEY` lives only in your local `.env`, which is git-ignored
+  (`.gitignore`) and docker-ignored (`.dockerignore`) — it is never committed
+  and never baked into a built image.
+- Copy `.env.example` → `.env` and fill in your own key; `.env.example`
+  contains only placeholder values, safe to commit.
+- Supply the key to a running container at `docker run`/`docker compose up`
+  time via `--env-file .env` (or `-e OPENAI_API_KEY=...`), never via `COPY`,
+  `ARG`, or hardcoding in the `Dockerfile`.
+- Application handlers never return or log provider exception text, raw model
+  output, or stack traces — only stage timings for successful requests. Don't
+  add logging that captures request/response bodies in a way that could leak
+  the key or note content to a shared log sink without review.
+- If a key is ever exposed (committed, logged, pasted into a shared channel),
+  rotate it in the OpenAI dashboard immediately — treat the old value as
+  compromised, don't just delete it from history.
+- Before pushing a Docker image publicly, double-check with `docker history`
+  or by inspecting layers that no `.env` or key ever entered the build context
+  (the current `.dockerignore` already excludes it, but re-verify after any
+  Dockerfile change).
