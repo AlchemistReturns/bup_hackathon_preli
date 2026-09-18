@@ -6,6 +6,13 @@ them before they ever touch the optimizer, and an independent replay stage
 re-verifies the final plan before it's returned. See `docs/OPTIMIZER.md` for
 the LP formulation itself.
 
+## At a glance
+
+![GridWise request pipeline: untrusted LLM interpretation feeds deterministic guardrails, optimizer, and replay stages](diagram.png)
+
+*Red = untrusted LLM output, green = deterministic code, blue = request/response.
+The detailed flow below expands each stage, including caching and error paths.*
+
 ## Flow
 
 ```mermaid
