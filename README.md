@@ -281,7 +281,7 @@ docker run --rm -p 8000:8000 --env-file .env abrar19/gridwise:latest
 curl http://localhost:8000/health
 ```
 Published: [`docker.io/abrar19/gridwise:latest`](https://hub.docker.com/r/abrar19/gridwise)
-(digest `sha256:7e11beecc5ce93f68ab49553b8499fcf65fffa21871ab6964af145443b7e712a`),
+(digest `sha256:7a62777b9115ac65406191aa5cefb29ff34c06c573f6d557031ab2b4654325e7`),
 verified with a clean-state pull + 10/10 live sample check (§5) before publishing.
 
 > Always verify the exact tag/digest you pulled matches what's published above,
