@@ -30,7 +30,11 @@ class PipelineState(TypedDict):
 def node_call_llm(state: PipelineState) -> PipelineState:
     state["attempts"] += 1
     try:
-        raw = interpret_notes(state["operator_notes"], feedback=state.get("error"))
+        raw = interpret_notes(
+            state["operator_notes"],
+            feedback=state.get("error"),
+            battery_capacity=state.get("battery_capacity"),
+        )
         state["raw_output"] = raw
         state["error"] = None
     except Exception as e:
@@ -48,6 +52,7 @@ def node_validate(state: PipelineState) -> PipelineState:
             state["raw_output"],
             num_notes=len(state["operator_notes"]),
             battery_capacity=state["battery_capacity"],
+            operator_notes=state.get("operator_notes"),
         )
         state["validated"] = validated
         state["error"] = None

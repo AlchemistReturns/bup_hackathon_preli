@@ -4,7 +4,8 @@ The LLM's JSON is never trusted directly — every field is checked here
 before anything is handed to the optimizer. Any failure raises
 GuardrailError with a message that is fed back to the LLM for a retry.
 """
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, List, Optional
 from app.config import DIRECTIVE_TYPES
 from app.schemas import DirectiveInterpretation
 
@@ -22,6 +23,39 @@ REQUIRED_KEYS = {
 }
 
 
+def _parse_time(t_str: str) -> Optional[int]:
+    t_str = t_str.strip().lower()
+    if t_str == "noon":
+        return 12
+    if t_str == "midnight":
+        return 0
+    m = re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", t_str)
+    if not m:
+        return None
+    hr = int(m.group(1))
+    period = m.group(3)
+    if period == "am":
+        return 0 if hr == 12 else hr
+    else:
+        return 12 if hr == 12 else hr + 12
+
+
+def extract_time_window(text: str) -> Optional[List[int]]:
+    """Extract 0-indexed hour window from natural language like 'from 6 PM until 9 PM'."""
+    m = re.search(
+        r"(?:from|between)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)|noon|midnight)\s+(?:until|to|and)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)|noon|midnight)",
+        text,
+        re.I,
+    )
+    if not m:
+        return None
+    start = _parse_time(m.group(1))
+    end = _parse_time(m.group(2))
+    if start is not None and end is not None and end > start:
+        return list(range(start, end))
+    return None
+
+
 def _check_hours(hours: Any) -> List[int]:
     if not isinstance(hours, list) or len(hours) == 0:
         raise GuardrailError("hours must be a non-empty list of integers")
@@ -36,7 +70,12 @@ def _check_hours(hours: Any) -> List[int]:
     return hours
 
 
-def validate_entry(entry: Dict[str, Any], expected_note_index: int, battery_capacity: float) -> DirectiveInterpretation:
+def validate_entry(
+    entry: Dict[str, Any],
+    expected_note_index: int,
+    battery_capacity: float,
+    note_text: Optional[str] = None,
+) -> DirectiveInterpretation:
     if not isinstance(entry, dict):
         raise GuardrailError(f"entry for note {expected_note_index} is not an object")
 
@@ -82,6 +121,12 @@ def validate_entry(entry: Dict[str, Any], expected_note_index: int, battery_capa
     if extra:
         raise GuardrailError(f"note {expected_note_index}: {directive_type} has unexpected keys {sorted(extra)}")
 
+    # If note_text has an unambiguous time window, ensure adjustment['hours'] matches
+    if note_text and "hours" in adjustment:
+        det_window = extract_time_window(note_text)
+        if det_window is not None:
+            adjustment["hours"] = det_window
+
     _check_hours(adjustment["hours"])
 
     if directive_type == "solar_reduction":
@@ -90,6 +135,13 @@ def validate_entry(entry: Dict[str, Any], expected_note_index: int, battery_capa
             raise GuardrailError(f"note {expected_note_index}: factor must be a number in [0, 1]")
 
     if directive_type == "minimum_battery_reserve":
+        # Check if note expressed reserve as a percentage of battery capacity
+        if note_text:
+            pct_m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*(?:of\s+(?:the\s+)?battery)?", note_text, re.I)
+            if pct_m:
+                calc_kwh = (float(pct_m.group(1)) / 100.0) * battery_capacity
+                adjustment["minimum_energy_kwh"] = round(calc_kwh, 4)
+
         val = adjustment["minimum_energy_kwh"]
         if not isinstance(val, (int, float)) or isinstance(val, bool) or val < 0:
             raise GuardrailError(f"note {expected_note_index}: minimum_energy_kwh must be a non-negative number")
@@ -110,7 +162,12 @@ def validate_entry(entry: Dict[str, Any], expected_note_index: int, battery_capa
     )
 
 
-def validate_all(raw_entries: List[Dict[str, Any]], num_notes: int, battery_capacity: float) -> List[DirectiveInterpretation]:
+def validate_all(
+    raw_entries: List[Dict[str, Any]],
+    num_notes: int,
+    battery_capacity: float,
+    operator_notes: Optional[List[str]] = None,
+) -> List[DirectiveInterpretation]:
     if not isinstance(raw_entries, list):
         raise GuardrailError("top-level output must be a JSON list")
     if len(raw_entries) != num_notes:
@@ -119,7 +176,8 @@ def validate_all(raw_entries: List[Dict[str, Any]], num_notes: int, battery_capa
     validated = []
     seen_indices = set()
     for i, entry in enumerate(raw_entries):
-        parsed = validate_entry(entry, i, battery_capacity)
+        note_text = operator_notes[i] if operator_notes and i < len(operator_notes) else None
+        parsed = validate_entry(entry, i, battery_capacity, note_text=note_text)
         if parsed.note_index in seen_indices:
             raise GuardrailError(f"duplicate note_index {parsed.note_index}")
         seen_indices.add(parsed.note_index)

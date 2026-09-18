@@ -18,14 +18,25 @@ SYSTEM_PROMPT = """You are the operator-note interpreter for a campus energy opt
 Convert each operator note into exactly one directive. Supported directive types:
 
 - solar_reduction: {"hours": [...], "factor": number}   // factor = fraction of solar that REMAINS (80% reduction -> factor 0.2)
-- minimum_battery_reserve: {"hours": [...], "minimum_energy_kwh": number}
+- minimum_battery_reserve: {"hours": [...], "minimum_energy_kwh": number} // If given as a percentage of battery capacity (e.g. 50% of 200 kWh = 100 kWh), calculate the numeric kWh.
 - no_charge_window: {"hours": [...]}
 - no_discharge_window: {"hours": [...]}
 - max_grid_window: {"hours": [...], "max_grid_kwh": number}
 - no_op: structured_adjustment must be null (use for notes that do not change the 24-hour energy schedule)
 
 Rules:
-- Time windows are whole hours. "1 PM to 3 PM" means hours [13, 14] (end hour excluded).
+- CRITICAL WINDOW FORMULA:
+  For any window 'from X PM until Y PM', the mathematical formula is:
+  start_hour = X + 12
+  end_hour = Y + 12
+  num_hours = end_hour - start_hour = Y - X
+  hours = list(range(start_hour, end_hour))
+  Examples:
+  - "from 6 PM until 10 PM": X=6, Y=10 -> start=18, end=22. num_hours=4 -> hours: [18, 19, 20, 21] (length MUST be 4!)
+  - "from 6 PM until 9 PM": X=6, Y=9 -> start=18, end=21. num_hours=3 -> hours: [18, 19, 20] (length MUST be 3!)
+  - "from 7 PM until 10 PM": X=7, Y=10 -> start=19, end=22. num_hours=3 -> hours: [19, 20, 21] (length MUST be 3!)
+  - "from 7 PM until 9 PM": X=7, Y=9 -> start=19, end=21. num_hours=2 -> hours: [19, 20] (length MUST be 2!)
+  - "from 1 PM to 3 PM": X=1, Y=3 -> start=13, end=15. num_hours=2 -> hours: [13, 14] (length MUST be 2!)
 - hours must be unique integers 0-23 in ascending order.
 - Do not invent demand, solar, tariff, or battery parameters.
 - Do not invent directive types outside the six listed above.
@@ -36,17 +47,24 @@ No prose, no markdown fences, JSON array only.
 """
 
 
-def build_user_prompt(operator_notes: List[str]) -> str:
+def build_user_prompt(operator_notes: List[str], battery_capacity: Optional[float] = None) -> str:
     lines = [f"{i}: {note}" for i, note in enumerate(operator_notes)]
-    return "Operator notes:\n" + "\n".join(lines)
+    prompt = "Operator notes:\n" + "\n".join(lines)
+    if battery_capacity is not None:
+        prompt += f"\n\nBattery capacity: {battery_capacity} kWh"
+    return prompt
 
 
-def interpret_notes(operator_notes: List[str], feedback: Optional[str] = None) -> list:
+def interpret_notes(
+    operator_notes: List[str],
+    feedback: Optional[str] = None,
+    battery_capacity: Optional[float] = None,
+) -> list:
     """Calls the OpenAI Responses API and returns the parsed raw JSON list.
     Raises ValueError if the response is not valid JSON.
     """
     client = get_client()
-    user_prompt = build_user_prompt(operator_notes)
+    user_prompt = build_user_prompt(operator_notes, battery_capacity=battery_capacity)
     if feedback:
         user_prompt += (
             "\n\nYour previous output was rejected by the validator for this reason:\n"
@@ -55,10 +73,8 @@ def interpret_notes(operator_notes: List[str], feedback: Optional[str] = None) -
 
     response = client.responses.create(
         model=OPENAI_MODEL,
-        input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
+        instructions=SYSTEM_PROMPT,
+        input=user_prompt,
         temperature=0,
     )
 
